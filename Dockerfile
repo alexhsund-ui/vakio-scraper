@@ -10,9 +10,9 @@ RUN npm install --omit=dev
 # Kopiera appens källkod
 COPY . .
 
-# Render sätter PORT i env; Express läser process.env.PORT
+# Render sätter PORT som env; Express läser process.env.PORT
 ENV PORT=3000
 EXPOSE 3000
 
-# Starta servern
-CMD ["npm", "start"]
+# Kör Node direkt (undviker npm:s SIGTERM-logg)
+CMD ["node", "server.js"]
