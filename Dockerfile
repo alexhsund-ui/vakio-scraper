@@ -1,9 +1,9 @@
-# Färdig Playwright-bild med Chromium och alla OS-beroenden
-FROM mcr.microsoft.com/playwright:v1.47.2-jammy
+# Matcha exakt samma Playwright-version som i package.json
+FROM mcr.microsoft.com/playwright:v1.55.1-jammy
 
 WORKDIR /app
 
-# Installera npm-paket (utan att kräva package-lock.json)
+# Installera npm-paket
 COPY package*.json ./
 RUN npm install --omit=dev
 
