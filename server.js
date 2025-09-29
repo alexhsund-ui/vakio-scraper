@@ -5,15 +5,22 @@ import pRetry from 'p-retry';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- CORS: tillåt frontend från vilken domän som helst (enkelt) ---
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // eller byt till din/domäner
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // Enkel minnescache så vi inte spammar sajten
 let CACHE = { ts: 0, data: null };
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
 
-// Normalisering likt det vi haft i Next
 const OUT = ['1', 'X', '2'];
 function normalizeAny(json) {
   const out = [];
-
   function push(g) {
     const home = g?.homeName ?? g?.home ?? g?.homeTeam?.name ?? g?.teams?.[0]?.name ?? g?.competitors?.[0]?.name;
     const away = g?.awayName ?? g?.away ?? g?.awayTeam?.name ?? g?.teams?.[1]?.name ?? g?.competitors?.[1]?.name;
@@ -24,7 +31,9 @@ function normalizeAny(json) {
     const odds = {};
     for (let i = 0; i < 3; i++) {
       const c = choices[i] || {};
-      const p = Number(c.percentage ?? c.percent ?? c.selectionPercentage ?? c.probabilityPct ?? c.probability);
+      const p = Number(
+        c.percentage ?? c.percent ?? c.selectionPercentage ?? c.probabilityPct ?? c.probability
+      );
       const o = Number(c.odds ?? c.price ?? c.decimalOdds ?? c.o);
       if (!Number.isNaN(p)) percent[OUT[i]] = p;
       if (!Number.isNaN(o) && o > 1) odds[OUT[i]] = o;
@@ -87,18 +96,15 @@ function enrich(matches) {
 }
 
 async function fetchVeikkausDraw() {
-  // 1) Starta Chromium
   const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
   const context = await browser.newContext();
   const page = await context.newPage();
 
-  // Anti-bot kosmetik
   await context.addInitScript(() => {
     try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
   });
 
   try {
-    // 2) Gå till startsidan och klicka bort cookies
     await page.goto('https://www.veikkaus.fi/', { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
     const cookieSelectors = [
@@ -113,11 +119,9 @@ async function fetchVeikkausDraw() {
       } catch {}
     }
 
-    // 3) Öppna vadslagningssidan
     await page.goto('https://www.veikkaus.fi/sv/vedonlyonti', { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
 
-    // 4) Testa olika officiella endpoints som ibland fungerar
     const endpoints = [
       'https://www.veikkaus.fi/api/sport-open/v1/games/VAKIO/draws',
       'https://www.veikkaus.fi/api/sport-open-games/v1/games/VAKIO/draws',
@@ -143,7 +147,6 @@ async function fetchVeikkausDraw() {
       const r = await tryFetch(u);
       tries.push({ url: u, status: r.status, ok: r.ok, sample: r.text ? r.text.slice(0, 200) : '' });
       if (r.ok && r.text && r.text.length > 50) {
-        // Hittade JSON – försök normalisera
         let data = null;
         try { data = JSON.parse(r.text); } catch {}
         if (data) {
@@ -156,11 +159,14 @@ async function fetchVeikkausDraw() {
           let matches = [];
           const push = arr => { if (!matches.length && arr.length === 13) matches = arr; };
           for (const d of candidates) {
-            push(normalizeAny(d));
+            const arr = normalizeAny(d);
+            push(arr);
             if (matches.length === 13) break;
           }
-          if (matches.length !== 13) push(normalizeAny(data));
-
+          if (matches.length !== 13) {
+            const arr = normalizeAny(data);
+            push(arr);
+          }
           if (matches.length === 13) {
             await browser.close();
             return { ok: true, source: u, tries, matches: enrich(matches) };
@@ -169,10 +175,9 @@ async function fetchVeikkausDraw() {
       }
     }
 
-    // 5) Sista utväg: ibland finns JSON inline i HTML i <script> – plocka ut allt och leta
     const html = await page.content();
     const jsonBlobs = [];
-    const regex = /<script[^>]*>\s*({[\s\S]*?})\s*<\/script>/g; // grovt: hitta JSON-liknande script
+    const regex = /<script[^>]*>\s*({[\s\S]*?})\s*<\/script>/g;
     let m;
     while ((m = regex.exec(html)) !== null) {
       const blob = m[1];
