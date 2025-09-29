@@ -3,14 +3,14 @@ FROM mcr.microsoft.com/playwright:v1.47.2-jammy
 
 WORKDIR /app
 
-# Installera npm-paket
+# Installera npm-paket (utan att kräva package-lock.json)
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # Kopiera appens källkod
 COPY . .
 
-# Render exponerar PORT som env-variabel. Vår server läser process.env.PORT.
+# Render sätter PORT i env; Express läser process.env.PORT
 ENV PORT=3000
 EXPOSE 3000
 
