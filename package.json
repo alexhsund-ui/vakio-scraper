@@ -5,9 +5,7 @@
   "description": "Headless Playwright scraper for Veikkaus Vakio",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "render-build": "node render-install.js",
-    "postinstall": "npx playwright install --with-deps chromium"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
