@@ -1,0 +1,17 @@
+{
+  "name": "vakio-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless Playwright scraper for Veikkaus Vakio",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "render-build": "node render-install.js",
+    "postinstall": "npx playwright install --with-deps chromium"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.47.2",
+    "p-retry": "^6.2.0"
+  }
+}
