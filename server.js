@@ -5,21 +5,22 @@ import pRetry from 'p-retry';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- CORS för frontend ---
+// --- CORS ---
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // byt till din domän om du vill låsa ned
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// --- Enkel minnescache ---
-let CACHE = { ts: 0, data: null };
+// --- Cache ---
+let CACHE = { ts: 0, data: {} };
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
 
-// --- Hjälpfunktioner för normalisering ---
+// --- Hjälpfunktioner ---
 const OUT = ['1', 'X', '2'];
+
 function normalizeAny(json) {
   const out = [];
 
@@ -49,6 +50,7 @@ function normalizeAny(json) {
     }
   }
 
+  // Samla kandidater
   const candidates = [];
   if (Array.isArray(json)) candidates.push(...json);
   if (json && typeof json === 'object') {
@@ -57,17 +59,22 @@ function normalizeAny(json) {
       if (Array.isArray(json[k])) candidates.push(...json[k]);
   }
 
+  // BFS igenom hela trädet och plocka “match-liknande” objekt
   const stack = [...candidates];
   const flat = [];
+  const seen = new Set();
   while (stack.length) {
     const x = stack.shift();
-    if (!x) continue;
+    if (!x || seen.has(x)) continue;
+    seen.add(x);
     if (Array.isArray(x)) stack.push(...x);
     else if (typeof x === 'object') {
       if (x.choices || x.outcomes || x.selections) flat.push(x);
-      for (const v of Object.values(x)) if (v && (typeof v === 'object' || Array.isArray(v))) stack.push(v);
+      for (const v of Object.values(x))
+        if (v && (typeof v === 'object' || Array.isArray(v))) stack.push(v);
     }
   }
+
   for (const g of flat) {
     push(g);
     if (out.length >= 13) break;
@@ -79,6 +86,7 @@ function implied(odds) {
   if (!odds || odds <= 1e-9) return undefined;
   return 1 / odds;
 }
+
 function enrich(matches) {
   return matches.map(m => {
     const a = implied(m.odds?.['1']);
@@ -95,25 +103,30 @@ function enrich(matches) {
   });
 }
 
-// ——— KÄRNAN: fånga ALLA JSON-svar när vi öppnar sidan ———
+// Hjälp: vänta lite och scrolla för att trigga XHR
+async function slowScroll(page, steps = 6, pauseMs = 500) {
+  for (let i = 0; i < steps; i++) {
+    try { await page.mouse.wheel(0, 1000); } catch {}
+    await page.waitForTimeout(pauseMs);
+  }
+}
+
 async function scrapeViaKohde(kohdeId) {
   const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const context = await browser.newContext();
+  const context = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
+    locale: 'sv-SE',
+  });
   const page = await context.newPage();
 
-  // anti-bot + språkinställning + cookie-consent
   await context.addInitScript(() => {
     try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
     try { localStorage.setItem('LANG', 'sv'); } catch {}
-    try {
-      const now = new Date();
-      const consent = 'isGpcEnabled=0&datestamp=' + now.toISOString() + '&version=6.33.0&hosts=&consentId=fake&interactionCount=1&landingPath=NotApplicable&groups=C0001:1,C0002:1,C0003:1,C0004:1&geolocation=FI;AX&AwaitingReconsent=false';
-      localStorage.setItem('OptanonConsent', consent);
-    } catch {}
   });
 
-  const captured = []; // {url,status,ct,len,body(sample)}
-  const jsonBodies = []; // parsed JSONs
+  const captured = [];
+  const jsonBodies = [];
 
   page.on('response', async (resp) => {
     try {
@@ -131,9 +144,9 @@ async function scrapeViaKohde(kohdeId) {
   });
 
   try {
-    // 1) Gå till startsida och klicka bort cookies
-    await page.goto('https://www.veikkaus.fi/', { waitUntil: 'domcontentloaded' });
-    await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+    // 1) Hem och cookie-consent
+    await page.goto('https://www.veikkaus.fi/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
     const cookieSelectors = [
       '#onetrust-accept-btn-handler',
       'button:has-text("Godkänn")', 'button:has-text("Acceptera")',
@@ -146,109 +159,110 @@ async function scrapeViaKohde(kohdeId) {
       } catch {}
     }
 
-    // 2) Navigera till kohde-sidan om given; annars försök hitta första “Vakio”-kohde
+    // 2) Gå till rätt sida
     let targetUrl;
     if (kohdeId) {
       targetUrl = `https://www.veikkaus.fi/sv/vedonlyonti/vakio?kohde=${encodeURIComponent(kohdeId)}`;
     } else {
-      await page.goto('https://www.veikkaus.fi/sv/vedonlyonti', { waitUntil: 'domcontentloaded' });
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-      // leta efter första länken som ser ut som vakio?kohde=...
-      targetUrl = await page.evaluate(() => {
-        const as = Array.from(document.querySelectorAll('a[href*="/vedonlyonti/vakio?kohde="]'));
-        const cand = as.find(a => a.getAttribute('href') && a.getAttribute('href').includes('vakio?kohde='));
-        if (cand) {
-          const href = cand.getAttribute('href');
-          if (!href) return null;
-          if (href.startsWith('http')) return href;
-          return new URL(href, location.origin).toString();
-        }
-        return null;
-      });
-      if (!targetUrl) {
-        // sista utväg: prova “alla objekt”-sida på svenska
-        targetUrl = 'https://www.veikkaus.fi/sv/vedonlyonti/vakio';
-      }
+      targetUrl = 'https://www.veikkaus.fi/sv/vedonlyonti/vakio';
     }
 
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-    // ge sidan lite tid att ladda in XHR/JSON
-    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+    // Prova på svenska, om tomt så prova finska
+    const candidates = [targetUrl, targetUrl.replace('/sv/', '/fi/')];
 
-    // 3) Försök hitta 13 matcher i fångade JSON-svar
-    for (const obj of jsonBodies) {
-      const arr = normalizeAny(obj);
-      if (arr.length === 13) {
-        await browser.close();
-        return { ok: true, source: 'xhr-capture', kohde: kohdeId || null, url: targetUrl, matches: enrich(arr), captured };
-      }
-    }
+    for (const url of candidates) {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await slowScroll(page, 8, 400); // trigga XHR
+      await page.waitForTimeout(2000);
 
-    // 4) Försök också med inline script JSON (om appen injicerar data i <script>)
-    const html = await page.content();
-    const jsonBlobs = [];
-    const regex = /<script[^>]*>\s*({[\s\S]*?})\s*<\/script>/g;
-    let m;
-    while ((m = regex.exec(html)) !== null) {
-      const blob = m[1];
-      if (blob && blob.length > 200) jsonBlobs.push(blob);
-    }
-    for (const blob of jsonBlobs) {
-      try {
-        const obj = JSON.parse(blob);
-        const arr = normalizeAny(obj);
-        if (arr.length === 13) {
-          await browser.close();
-          return { ok: true, source: 'inline-script', kohde: kohdeId || null, url: targetUrl, matches: enrich(arr), captured };
-        }
-      } catch {}
-    }
-
-    // 5) Som sista försök: de gamla endpointsen (kan vara 404/400 ofta)
-    const endpoints = [
-      'https://www.veikkaus.fi/api/sport-open/v1/games/VAKIO/draws',
-      'https://www.veikkaus.fi/api/sport-open-games/v1/games/VAKIO/draws',
-      'https://www.veikkaus.fi/api/v1/sport-games/draws?game-names=VAKIO&status=OPEN',
-      'https://www.veikkaus.fi/api/v1/sport-games/draws?game-names=SPORT&status=OPEN'
-    ];
-    const headers = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'X-ESA-API-Key': 'ROBOT' };
-    const tries = [];
-    async function tryFetch(u) {
-      return await page.evaluate(async ({ u, headers }) => {
+      // 2a) Läs script[type="application/json"]
+      const scriptJsons = await page.$$eval('script[type="application/json"]', nodes =>
+        nodes.map(n => n.textContent).filter(Boolean)
+      ).catch(() => []);
+      for (const s of scriptJsons) {
         try {
-          const r = await fetch(u, { headers, credentials: 'include' });
-          const txt = await r.text();
-          return { ok: r.ok, status: r.status, text: txt };
-        } catch (e) {
-          return { ok: false, status: 0, text: String(e) };
-        }
-      }, { u, headers });
-    }
-    for (const u of endpoints) {
-      const r = await tryFetch(u);
-      tries.push({ url: u, status: r.status, ok: r.ok, sample: r.text ? r.text.slice(0, 200) : '' });
-      if (r.ok && r.text && r.text.length > 50) {
-        try {
-          const obj = JSON.parse(r.text);
+          const obj = JSON.parse(s);
           const arr = normalizeAny(obj);
           if (arr.length === 13) {
             await browser.close();
-            return { ok: true, source: u, kohde: kohdeId || null, url: targetUrl, matches: enrich(arr), captured, tries };
+            return { ok: true, source: 'script-json', kohde: kohdeId || null, url, matches: enrich(arr), captured };
           }
         } catch {}
+      }
+
+      // 2b) Kolla alla fångade XHR/Fetch-svar hittills
+      for (const obj of jsonBodies) {
+        const arr = normalizeAny(obj);
+        if (arr.length === 13) {
+          await browser.close();
+          return { ok: true, source: 'xhr-capture', kohde: kohdeId || null, url, matches: enrich(arr), captured };
+        }
+      }
+
+      // 2c) Fösök tvinga inläsning från clienten själv (körs i sidans session)
+      const forced = await page.evaluate(async () => {
+        // prova att leta i "window" efter stora objekt
+        const results = [];
+        const keys = Object.getOwnPropertyNames(window);
+        for (const k of keys) {
+          try {
+            const v = window[k];
+            if (v && typeof v === 'object') results.push(v);
+          } catch {}
+        }
+        return results.slice(0, 40); // ta inte för många
+      }).catch(() => []);
+      for (const obj of forced) {
+        try {
+          const arr = normalizeAny(obj);
+          if (arr.length === 13) {
+            await browser.close();
+            return { ok: true, source: 'window-probe', kohde: kohdeId || null, url, matches: enrich(arr), captured };
+          }
+        } catch {}
+      }
+
+      // 2d) Sista: försök ett par troliga interna REST via fetch inuti sidan
+      const restCandidates = [
+        '/api/sport-open/v1/games/VAKIO/draws',
+        '/api/sport-open-games/v1/games/VAKIO/draws',
+        '/api/v1/sport-games/draws?game-names=VAKIO&status=OPEN',
+        '/api/v1/sport-games/draws?game-names=SPORT&status=OPEN',
+      ];
+      for (const rel of restCandidates) {
+        const r = await page.evaluate(async (rel) => {
+          try {
+            const u = new URL(rel, location.origin).toString();
+            const resp = await fetch(u, { credentials: 'include' });
+            const t = await resp.text();
+            return { ok: resp.ok, status: resp.status, text: t };
+          } catch (e) {
+            return { ok: false, status: 0, text: String(e) };
+          }
+        }, rel);
+        if (r && r.ok && r.text && r.text.length > 50) {
+          try {
+            const obj = JSON.parse(r.text);
+            const arr = normalizeAny(obj);
+            if (arr.length === 13) {
+              await browser.close();
+              return { ok: true, source: rel, kohde: kohdeId || null, url, matches: enrich(arr), captured };
+            }
+          } catch {}
+        }
       }
     }
 
     await browser.close();
-    return { ok: false, error: 'No 13-match draw found', kohde: kohdeId || null, url: targetUrl, captured, tries };
+    return { ok: false, error: 'No 13-match draw found', kohde: kohdeId || null, url: candidates[candidates.length - 1], captured: captured.slice(0, 3) };
   } catch (err) {
     await browser.close();
     return { ok: false, error: String(err) };
   }
 }
 
-// ——— ROUTES ———
+// --- ROUTES ---
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'vakio-scraper', ts: Date.now() });
 });
@@ -258,25 +272,23 @@ app.get('/api/veikkaus/stryktips1', async (req, res) => {
     const force = String(req.query.force || '') === '1';
     const kohde = typeof req.query.kohde === 'string' ? req.query.kohde : undefined;
 
-    // cache-nyckel: olika kohde ska cacheas separat
     const cacheKey = kohde ? `k:${kohde}` : 'k:auto';
     const now = Date.now();
 
-    if (!force && CACHE.data && CACHE.data[cacheKey] && (now - CACHE.ts) < CACHE_TTL_MS) {
+    if (!force && CACHE.data[cacheKey] && (now - CACHE.ts) < CACHE_TTL_MS) {
       res.set('cache-control', 'public, max-age=60');
-      return res.json({ route: 'veikkaus', cached: true, ageSec: Math.round((now - CACHE.ts) / 1000), ...(CACHE.data[cacheKey]) });
+      return res.json({ route: 'veikkaus', cached: true, ageSec: Math.round((now - CACHE.ts) / 1000), ...CACHE.data[cacheKey] });
     }
 
     const result = await pRetry(() => scrapeViaKohde(kohde), { retries: 1 });
     if (result.ok) {
       const payload = { ok: true, endpoint: result.source, kohde: result.kohde, url: result.url, matches: result.matches };
-      CACHE.data = CACHE.data || {};
       CACHE.data[cacheKey] = payload;
       CACHE.ts = now;
       res.set('cache-control', 'public, max-age=60');
       return res.json({ route: 'veikkaus', cached: false, ...payload });
     } else {
-      return res.status(502).json({ route: 'veikkaus', error: result.error || 'unknown', kohde: result.kohde, url: result.url, tries: result.tries || [], captured: (result.captured || []).slice(0, 3) });
+      return res.status(502).json({ route: 'veikkaus', error: result.error || 'unknown', kohde: result.kohde, url: result.url, captured: result.captured || [] });
     }
   } catch (e) {
     return res.status(500).json({ route: 'veikkaus', error: String(e) });
