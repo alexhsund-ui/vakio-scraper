@@ -5,22 +5,24 @@ import pRetry from 'p-retry';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- CORS: tillåt frontend från vilken domän som helst (enkelt) ---
+// --- CORS för frontend ---
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // eller byt till din/domäner
+  res.setHeader('Access-Control-Allow-Origin', '*'); // byt till din domän om du vill låsa ned
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// Enkel minnescache så vi inte spammar sajten
+// --- Enkel minnescache ---
 let CACHE = { ts: 0, data: null };
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
 
+// --- Hjälpfunktioner för normalisering ---
 const OUT = ['1', 'X', '2'];
 function normalizeAny(json) {
   const out = [];
+
   function push(g) {
     const home = g?.homeName ?? g?.home ?? g?.homeTeam?.name ?? g?.teams?.[0]?.name ?? g?.competitors?.[0]?.name;
     const away = g?.awayName ?? g?.away ?? g?.awayTeam?.name ?? g?.teams?.[1]?.name ?? g?.competitors?.[1]?.name;
@@ -31,9 +33,7 @@ function normalizeAny(json) {
     const odds = {};
     for (let i = 0; i < 3; i++) {
       const c = choices[i] || {};
-      const p = Number(
-        c.percentage ?? c.percent ?? c.selectionPercentage ?? c.probabilityPct ?? c.probability
-      );
+      const p = Number(c.percentage ?? c.percent ?? c.selectionPercentage ?? c.probabilityPct ?? c.probability);
       const o = Number(c.odds ?? c.price ?? c.decimalOdds ?? c.o);
       if (!Number.isNaN(p)) percent[OUT[i]] = p;
       if (!Number.isNaN(o) && o > 1) odds[OUT[i]] = o;
@@ -95,16 +95,43 @@ function enrich(matches) {
   });
 }
 
-async function fetchVeikkausDraw() {
+// ——— KÄRNAN: fånga ALLA JSON-svar när vi öppnar sidan ———
+async function scrapeViaKohde(kohdeId) {
   const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
   const context = await browser.newContext();
   const page = await context.newPage();
 
+  // anti-bot + språkinställning + cookie-consent
   await context.addInitScript(() => {
     try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
+    try { localStorage.setItem('LANG', 'sv'); } catch {}
+    try {
+      const now = new Date();
+      const consent = 'isGpcEnabled=0&datestamp=' + now.toISOString() + '&version=6.33.0&hosts=&consentId=fake&interactionCount=1&landingPath=NotApplicable&groups=C0001:1,C0002:1,C0003:1,C0004:1&geolocation=FI;AX&AwaitingReconsent=false';
+      localStorage.setItem('OptanonConsent', consent);
+    } catch {}
+  });
+
+  const captured = []; // {url,status,ct,len,body(sample)}
+  const jsonBodies = []; // parsed JSONs
+
+  page.on('response', async (resp) => {
+    try {
+      const url = resp.url();
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('application/json')) return;
+      const status = resp.status();
+      const text = await resp.text();
+      captured.push({ url, status, ct, len: text.length, sample: text.slice(0, 300) });
+      try {
+        const obj = JSON.parse(text);
+        jsonBodies.push(obj);
+      } catch {}
+    } catch {}
   });
 
   try {
+    // 1) Gå till startsida och klicka bort cookies
     await page.goto('https://www.veikkaus.fi/', { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
     const cookieSelectors = [
@@ -119,62 +146,46 @@ async function fetchVeikkausDraw() {
       } catch {}
     }
 
-    await page.goto('https://www.veikkaus.fi/sv/vedonlyonti', { waitUntil: 'domcontentloaded' });
-    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-
-    const endpoints = [
-      'https://www.veikkaus.fi/api/sport-open/v1/games/VAKIO/draws',
-      'https://www.veikkaus.fi/api/sport-open-games/v1/games/VAKIO/draws',
-      'https://www.veikkaus.fi/api/v1/sport-games/draws?game-names=VAKIO&status=OPEN',
-      'https://www.veikkaus.fi/api/v1/sport-games/draws?game-names=SPORT&status=OPEN'
-    ];
-    const headers = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'X-ESA-API-Key': 'ROBOT' };
-
-    async function tryFetch(u) {
-      return await page.evaluate(async ({ u, headers }) => {
-        try {
-          const r = await fetch(u, { headers, credentials: 'include' });
-          const txt = await r.text();
-          return { ok: r.ok, status: r.status, text: txt };
-        } catch (e) {
-          return { ok: false, status: 0, text: String(e) };
+    // 2) Navigera till kohde-sidan om given; annars försök hitta första “Vakio”-kohde
+    let targetUrl;
+    if (kohdeId) {
+      targetUrl = `https://www.veikkaus.fi/sv/vedonlyonti/vakio?kohde=${encodeURIComponent(kohdeId)}`;
+    } else {
+      await page.goto('https://www.veikkaus.fi/sv/vedonlyonti', { waitUntil: 'domcontentloaded' });
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      // leta efter första länken som ser ut som vakio?kohde=...
+      targetUrl = await page.evaluate(() => {
+        const as = Array.from(document.querySelectorAll('a[href*="/vedonlyonti/vakio?kohde="]'));
+        const cand = as.find(a => a.getAttribute('href') && a.getAttribute('href').includes('vakio?kohde='));
+        if (cand) {
+          const href = cand.getAttribute('href');
+          if (!href) return null;
+          if (href.startsWith('http')) return href;
+          return new URL(href, location.origin).toString();
         }
-      }, { u, headers });
-    }
-
-    const tries = [];
-    for (const u of endpoints) {
-      const r = await tryFetch(u);
-      tries.push({ url: u, status: r.status, ok: r.ok, sample: r.text ? r.text.slice(0, 200) : '' });
-      if (r.ok && r.text && r.text.length > 50) {
-        let data = null;
-        try { data = JSON.parse(r.text); } catch {}
-        if (data) {
-          const candidates = [];
-          if (Array.isArray(data)) candidates.push(...data);
-          else if (data && typeof data === 'object') {
-            if (Array.isArray(data.draws)) candidates.push(...data.draws);
-            else candidates.push(data);
-          }
-          let matches = [];
-          const push = arr => { if (!matches.length && arr.length === 13) matches = arr; };
-          for (const d of candidates) {
-            const arr = normalizeAny(d);
-            push(arr);
-            if (matches.length === 13) break;
-          }
-          if (matches.length !== 13) {
-            const arr = normalizeAny(data);
-            push(arr);
-          }
-          if (matches.length === 13) {
-            await browser.close();
-            return { ok: true, source: u, tries, matches: enrich(matches) };
-          }
-        }
+        return null;
+      });
+      if (!targetUrl) {
+        // sista utväg: prova “alla objekt”-sida på svenska
+        targetUrl = 'https://www.veikkaus.fi/sv/vedonlyonti/vakio';
       }
     }
 
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+    // ge sidan lite tid att ladda in XHR/JSON
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // 3) Försök hitta 13 matcher i fångade JSON-svar
+    for (const obj of jsonBodies) {
+      const arr = normalizeAny(obj);
+      if (arr.length === 13) {
+        await browser.close();
+        return { ok: true, source: 'xhr-capture', kohde: kohdeId || null, url: targetUrl, matches: enrich(arr), captured };
+      }
+    }
+
+    // 4) Försök också med inline script JSON (om appen injicerar data i <script>)
     const html = await page.content();
     const jsonBlobs = [];
     const regex = /<script[^>]*>\s*({[\s\S]*?})\s*<\/script>/g;
@@ -186,44 +197,86 @@ async function fetchVeikkausDraw() {
     for (const blob of jsonBlobs) {
       try {
         const obj = JSON.parse(blob);
-        const matches = normalizeAny(obj);
-        if (matches.length === 13) {
+        const arr = normalizeAny(obj);
+        if (arr.length === 13) {
           await browser.close();
-          return { ok: true, source: 'inline-script', tries: [], matches: enrich(matches) };
+          return { ok: true, source: 'inline-script', kohde: kohdeId || null, url: targetUrl, matches: enrich(arr), captured };
         }
       } catch {}
     }
 
+    // 5) Som sista försök: de gamla endpointsen (kan vara 404/400 ofta)
+    const endpoints = [
+      'https://www.veikkaus.fi/api/sport-open/v1/games/VAKIO/draws',
+      'https://www.veikkaus.fi/api/sport-open-games/v1/games/VAKIO/draws',
+      'https://www.veikkaus.fi/api/v1/sport-games/draws?game-names=VAKIO&status=OPEN',
+      'https://www.veikkaus.fi/api/v1/sport-games/draws?game-names=SPORT&status=OPEN'
+    ];
+    const headers = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'X-ESA-API-Key': 'ROBOT' };
+    const tries = [];
+    async function tryFetch(u) {
+      return await page.evaluate(async ({ u, headers }) => {
+        try {
+          const r = await fetch(u, { headers, credentials: 'include' });
+          const txt = await r.text();
+          return { ok: r.ok, status: r.status, text: txt };
+        } catch (e) {
+          return { ok: false, status: 0, text: String(e) };
+        }
+      }, { u, headers });
+    }
+    for (const u of endpoints) {
+      const r = await tryFetch(u);
+      tries.push({ url: u, status: r.status, ok: r.ok, sample: r.text ? r.text.slice(0, 200) : '' });
+      if (r.ok && r.text && r.text.length > 50) {
+        try {
+          const obj = JSON.parse(r.text);
+          const arr = normalizeAny(obj);
+          if (arr.length === 13) {
+            await browser.close();
+            return { ok: true, source: u, kohde: kohdeId || null, url: targetUrl, matches: enrich(arr), captured, tries };
+          }
+        } catch {}
+      }
+    }
+
     await browser.close();
-    return { ok: false, error: 'No 13-match draw found', tries };
+    return { ok: false, error: 'No 13-match draw found', kohde: kohdeId || null, url: targetUrl, captured, tries };
   } catch (err) {
     await browser.close();
     return { ok: false, error: String(err) };
   }
 }
 
-// Hälso-check
+// ——— ROUTES ———
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'vakio-scraper', ts: Date.now() });
 });
 
-// Huvud-API: /api/veikkaus/stryktips1
 app.get('/api/veikkaus/stryktips1', async (req, res) => {
   try {
     const force = String(req.query.force || '') === '1';
+    const kohde = typeof req.query.kohde === 'string' ? req.query.kohde : undefined;
+
+    // cache-nyckel: olika kohde ska cacheas separat
+    const cacheKey = kohde ? `k:${kohde}` : 'k:auto';
     const now = Date.now();
-    if (!force && CACHE.data && (now - CACHE.ts) < CACHE_TTL_MS) {
+
+    if (!force && CACHE.data && CACHE.data[cacheKey] && (now - CACHE.ts) < CACHE_TTL_MS) {
       res.set('cache-control', 'public, max-age=60');
-      return res.json({ route: 'veikkaus', cached: true, ageSec: Math.round((now - CACHE.ts) / 1000), ...CACHE.data });
+      return res.json({ route: 'veikkaus', cached: true, ageSec: Math.round((now - CACHE.ts) / 1000), ...(CACHE.data[cacheKey]) });
     }
 
-    const result = await pRetry(() => fetchVeikkausDraw(), { retries: 2 });
+    const result = await pRetry(() => scrapeViaKohde(kohde), { retries: 1 });
     if (result.ok) {
-      CACHE = { ts: now, data: { ok: true, endpoint: result.source, matches: result.matches } };
+      const payload = { ok: true, endpoint: result.source, kohde: result.kohde, url: result.url, matches: result.matches };
+      CACHE.data = CACHE.data || {};
+      CACHE.data[cacheKey] = payload;
+      CACHE.ts = now;
       res.set('cache-control', 'public, max-age=60');
-      return res.json({ route: 'veikkaus', cached: false, endpoint: result.source, matches: result.matches });
+      return res.json({ route: 'veikkaus', cached: false, ...payload });
     } else {
-      return res.status(502).json({ route: 'veikkaus', error: result.error || 'unknown', tries: result.tries || [] });
+      return res.status(502).json({ route: 'veikkaus', error: result.error || 'unknown', kohde: result.kohde, url: result.url, tries: result.tries || [], captured: (result.captured || []).slice(0, 3) });
     }
   } catch (e) {
     return res.status(500).json({ route: 'veikkaus', error: String(e) });
