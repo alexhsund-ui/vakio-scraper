@@ -6,14 +6,14 @@ const PORT = process.env.PORT || 3000;
 
 /** ===== CORS ===== */
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // byt till din domän om du vill låsa ned
+  res.setHeader('Access-Control-Allow-Origin', '*'); // lås till din domän vid behov
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-/** ===== Enkel “databas” i minnet =====
+/** ===== In-memory “DB” =====
  * cache[kohde] = {
  *   matches, endpoint, url, updatedAt
  *   inProgress, lastError, lastDebug
@@ -21,7 +21,7 @@ app.use((req, res, next) => {
  */
 const cache = Object.create(null);
 
-// Chromium “snål-läge”
+// Chromium “snål-läge” för Render
 const LAUNCH_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -37,6 +37,7 @@ const LAUNCH_ARGS = [
 ];
 
 const OUT = ['1', 'X', '2'];
+
 function normalizeAny(json) {
   const out = [];
   function push(g) {
@@ -115,12 +116,62 @@ function enrich(matches) {
   });
 }
 
-// liten hjälpare – abortera ett steg om det tar >ms
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label||'step'} timeout ${ms}ms`)), ms))
-  ]);
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+// blockera tunga resurser
+async function throttleResources(page) {
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+    route.continue();
+  });
+}
+
+// scroll för att trigga XHR
+async function slowScroll(page, steps = 6, pauseMs = 350) {
+  for (let i = 0; i < steps; i++) {
+    try { await page.mouse.wheel(0, 900); } catch {}
+    await page.waitForTimeout(pauseMs);
+  }
+}
+
+// försöker plocka 13 matcher ur allt vi ser på sidan
+async function tryExtractAll(page, jsonBodies) {
+  // a) JSON vi redan fångat
+  for (const obj of jsonBodies) {
+    const arr = normalizeAny(obj);
+    if (arr.length === 13) return { source: 'xhr-capture', matches: arr };
+  }
+  // b) script[type="application/json"]
+  const scriptJsons = await page.$$eval('script[type="application/json"]', nodes =>
+    nodes.map(n => n.textContent).filter(Boolean)
+  ).catch(() => []);
+  for (const s of scriptJsons) {
+    try {
+      const obj = JSON.parse(s);
+      const arr = normalizeAny(obj);
+      if (arr.length === 13) return { source: 'script-json', matches: arr };
+    } catch {}
+  }
+  // c) window-probe
+  const wndObjs = await page.evaluate(() => {
+    const results = [];
+    const keys = Object.getOwnPropertyNames(window);
+    for (const k of keys) {
+      try {
+        const v = window[k];
+        if (v && typeof v === 'object') results.push(v);
+      } catch {}
+    }
+    return results.slice(0, 60);
+  }).catch(() => []);
+  for (const obj of wndObjs) {
+    try {
+      const arr = normalizeAny(obj);
+      if (arr.length === 13) return { source: 'window-probe', matches: arr };
+    } catch {}
+  }
+  return null;
 }
 
 // själva skrapjobbet (körs i bakgrunden)
@@ -132,7 +183,7 @@ async function runJob(kohdeId, debug=false) {
   cache[key].lastError = null;
   cache[key].lastDebug = null;
 
-  const HARD_BUDGET_MS = 30000; // totalbudget per jobb (30s)
+  const HARD_BUDGET_MS = 40000; // 40s totalbudget
   const started = Date.now();
 
   const browser = await chromium.launch({ args: LAUNCH_ARGS });
@@ -140,17 +191,25 @@ async function runJob(kohdeId, debug=false) {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
     locale: 'sv-SE',
     javaScriptEnabled: true,
+    extraHTTPHeaders: { 'Accept-Language': 'sv-SE,sv;q=0.9,fi;q=0.8,en;q=0.7' }
   });
   const page = await context.newPage();
 
-  // blockera tunga resurser
-  await page.route('**/*', (route) => {
-    const type = route.request().resourceType();
-    if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
-    route.continue();
+  page.setDefaultTimeout(18000);
+  page.setDefaultNavigationTimeout(25000);
+
+  await throttleResources(page);
+
+  await context.addInitScript(() => {
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
+    try { localStorage.setItem('LANG', 'sv'); } catch {}
+    try {
+      const now = new Date();
+      const consent = 'isGpcEnabled=0&datestamp=' + now.toISOString() + '&version=6.33.0&hosts=&consentId=fake&interactionCount=1&landingPath=NotApplicable&groups=C0001:1,C0002:1,C0003:1,C0004:1&geolocation=FI;AX&AwaitingReconsent=false';
+      localStorage.setItem('OptanonConsent', consent);
+    } catch {}
   });
 
-  // fånga JSON
   const captured = [];
   const jsonBodies = [];
   page.on('response', async (resp) => {
@@ -166,46 +225,33 @@ async function runJob(kohdeId, debug=false) {
   });
 
   try {
-    page.setDefaultTimeout(12000);
-    page.setDefaultNavigationTimeout(20000);
-
-    await context.addInitScript(() => {
-      try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
-      try { localStorage.setItem('LANG', 'sv'); } catch {}
-      try {
-        const now = new Date();
-        const consent = 'isGpcEnabled=0&datestamp=' + now.toISOString() + '&version=6.33.0&hosts=&consentId=fake&interactionCount=1&landingPath=NotApplicable&groups=C0001:1,C0002:1,C0003:1,C0004:1&geolocation=FI;AX&AwaitingReconsent=false';
-        localStorage.setItem('OptanonConsent', consent);
-      } catch {}
-    });
-
-    // Gå till hemsidan (snabbt)
-    await withTimeout(page.goto('https://www.veikkaus.fi/', { waitUntil: 'domcontentloaded' }), 8000, 'home');
-
-    // Bygg mål-URL
     const baseSv = 'https://www.veikkaus.fi/sv/vedonlyonti/vakio';
     const baseFi = 'https://www.veikkaus.fi/fi/vedonlyonti/vakio';
     const urlSv = kohdeId ? `${baseSv}?kohde=${encodeURIComponent(kohdeId)}` : baseSv;
     const urlFi = kohdeId ? `${baseFi}?kohde=${encodeURIComponent(kohdeId)}` : baseFi;
+    const candidates = [urlSv, urlFi];
 
-    // prova på sv, sen fi
-    for (const url of [urlSv, urlFi]) {
-      if (Date.now() - started > HARD_BUDGET_MS) break;
+    // prova båda språken, 2 rundor vardera (med liten paus)
+    for (let round = 0; round < 2; round++) {
+      for (const url of candidates) {
+        if (Date.now() - started > HARD_BUDGET_MS) break;
 
-      await withTimeout(page.goto(url, { waitUntil: 'domcontentloaded' }), 12000, 'goto-vakio');
-      await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(()=>{});
-      // liten scroll för att trigga XHR
-      for (let i=0;i<4;i++){ try{ await page.mouse.wheel(0, 800);}catch{} await page.waitForTimeout(250); }
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(()=>{});
+        await slowScroll(page, 6, 300);
+        await sleep(800);
 
-      // Försök plocka från fångade JSON
-      for (const obj of jsonBodies) {
-        const arr = normalizeAny(obj);
-        if (arr.length === 13) {
-          const enriched = enrich(arr);
+        let got = await tryExtractAll(page, jsonBodies);
+        if (!got) {
+          await sleep(1200);
+          got = await tryExtractAll(page, jsonBodies);
+        }
+        if (got && got.matches?.length === 13) {
+          const enriched = enrich(got.matches);
           cache[key] = {
             ...cache[key],
             matches: enriched,
-            endpoint: 'xhr-capture',
+            endpoint: got.source,
             url,
             updatedAt: Date.now(),
             inProgress: false,
@@ -216,32 +262,7 @@ async function runJob(kohdeId, debug=false) {
           return;
         }
       }
-
-      // Script JSON
-      const scriptJsons = await page.$$eval('script[type="application/json"]', nodes =>
-        nodes.map(n => n.textContent).filter(Boolean)
-      ).catch(()=>[]);
-      for (const s of scriptJsons) {
-        try {
-          const obj = JSON.parse(s);
-          const arr = normalizeAny(obj);
-          if (arr.length === 13) {
-            const enriched = enrich(arr);
-            cache[key] = {
-              ...cache[key],
-              matches: enriched,
-              endpoint: 'script-json',
-              url,
-              updatedAt: Date.now(),
-              inProgress: false,
-              lastError: null,
-              lastDebug: debug ? { captured: captured.slice(0,5) } : null
-            };
-            await browser.close();
-            return;
-          }
-        } catch {}
-      }
+      await sleep(1200);
     }
 
     // Lyckades inte
@@ -259,7 +280,7 @@ async function runJob(kohdeId, debug=false) {
 
 /** ===== ROUTES ===== */
 
-// Hälso-check
+// Health
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'vakio-scraper', ts: Date.now() });
 });
@@ -285,7 +306,7 @@ app.get('/api/veikkaus/kick', async (req, res) => {
   });
 });
 
-// Hämta senaste kända data (svarar alltid snabbt)
+// Hämta senaste kända data (snabbt svar)
 app.get('/api/veikkaus/last', (req, res) => {
   const kohde = typeof req.query.kohde === 'string' ? req.query.kohde : undefined;
   const key = kohde || 'auto';
