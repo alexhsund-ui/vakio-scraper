@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 
 /** ===== CORS ===== */
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // lås till din domän om du vill
+  res.setHeader('Access-Control-Allow-Origin', '*'); // lås till din domän vid behov
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -134,14 +134,66 @@ async function slowScroll(page, steps = 6, pauseMs = 300) {
   }
 }
 
-/** Försök hitta 13 matcher i allt vi ser på sidan */
+/** Hämta kohde-id från vakio-listan (sv + fi) */
+async function discoverKohdeIds(context) {
+  const page = await context.newPage();
+  const ids = new Set();
+  await throttleResources(page);
+
+  const listPages = [
+    'https://www.veikkaus.fi/sv/vedonlyonti/vakio',
+    'https://www.veikkaus.fi/fi/vedonlyonti/vakio',
+  ];
+
+  for (const url of listPages) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      await slowScroll(page, 5, 250);
+
+      // <a href="...vakio?kohde=...">
+      const hrefIds = await page.$$eval('a[href*="vakio?kohde="]', els =>
+        els.map(a => {
+          try {
+            const u = new URL(a.href);
+            return u.searchParams.get('kohde');
+          } catch { return null; }
+        }).filter(Boolean)
+      );
+      hrefIds.forEach(k => ids.add(k));
+
+      // fallback: leta i html-text
+      const textIds = await page.evaluate(() => {
+        const rx = /\bkohde=a_\d{6,}\b/gi;
+        const all = new Set();
+        function scan(txt){ let m; while((m = rx.exec(txt))){ const id = m[0].split('=')[1]; all.add(id); } }
+        scan(document.documentElement.innerHTML);
+        return Array.from(all);
+      });
+      textIds.forEach(k => ids.add(k));
+
+    } catch (e) {
+      // fortsätt nästa sida
+    }
+  }
+
+  const sorted = Array.from(ids).sort((a, b) => {
+    const pa = parseInt(String(a).replace(/\D+/g,''), 10);
+    const pb = parseInt(String(b).replace(/\D+/g,''), 10);
+    return pb - pa; // nyast först
+  });
+
+  return sorted;
+}
+
+/** Försök hitta 13 matcher i alla datakällor vi ser på sidan */
 async function tryExtractAll(page, jsonBodies) {
-  // a) JSON som fångats via XHR
+  // XHR
   for (const obj of jsonBodies) {
     const arr = normalizeAny(obj);
     if (arr.length === 13) return { source: 'xhr-capture', matches: arr };
   }
-  // b) script[type="application/json"]
+  // script[type=json]
   const scriptJsons = await page.$$eval('script[type="application/json"]', nodes =>
     nodes.map(n => n.textContent).filter(Boolean)
   ).catch(() => []);
@@ -152,7 +204,7 @@ async function tryExtractAll(page, jsonBodies) {
       if (arr.length === 13) return { source: 'script-json', matches: arr };
     } catch {}
   }
-  // c) window-probe
+  // window-probe
   const wndObjs = await page.evaluate(() => {
     const results = [];
     const keys = Object.getOwnPropertyNames(window);
@@ -173,62 +225,7 @@ async function tryExtractAll(page, jsonBodies) {
   return null;
 }
 
-/** Hitta aktuella kohde-id från vakio-listan (sv + fi) */
-async function discoverKohdeIds(context) {
-  const page = await context.newPage();
-  const ids = new Set();
-
-  // blockera tunga resurser
-  await throttleResources(page);
-
-  const listPages = [
-    'https://www.veikkaus.fi/sv/vedonlyonti/vakio',
-    'https://www.veikkaus.fi/fi/vedonlyonti/vakio',
-  ];
-
-  for (const url of listPages) {
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
-      await slowScroll(page, 4, 250);
-
-      // Plocka kohde från <a href="...vakio?kohde=...">
-      const hrefIds = await page.$$eval('a[href*="vakio?kohde="]', els =>
-        els.map(a => {
-          try {
-            const u = new URL(a.href);
-            return u.searchParams.get('kohde');
-          } catch { return null; }
-        }).filter(Boolean)
-      );
-      hrefIds.forEach(k => ids.add(k));
-
-      // Plocka kohde även från text (fallback)
-      const textIds = await page.evaluate(() => {
-        const rx = /\bkohde=a_\d{6,}\b/gi;
-        const all = new Set();
-        function scan(txt){ let m; while((m = rx.exec(txt))){ const id = m[0].split('=')[1]; all.add(id); } }
-        scan(document.documentElement.innerHTML);
-        return Array.from(all);
-      });
-      textIds.forEach(k => ids.add(k));
-
-    } catch (e) {
-      // fortsätt nästa sida
-    }
-  }
-
-  // sortera nyast först (a_100522 > a_100516)
-  const sorted = Array.from(ids).sort((a, b) => {
-    const pa = parseInt(String(a).replace(/\D+/g,''), 10);
-    const pb = parseInt(String(b).replace(/\D+/g,''), 10);
-    return pb - pa;
-  });
-
-  return sorted;
-}
-
-/** Kör scraping-jobb för specifik kohde */
+/** Kör scraping-jobb för EN kohde med watchdog */
 async function runJobForKohde(kohdeId, debug=false) {
   const key = kohdeId;
   if (!cache[key]) cache[key] = {};
@@ -238,20 +235,21 @@ async function runJobForKohde(kohdeId, debug=false) {
   cache[key].lastError = null;
   cache[key].lastDebug = null;
 
-  const HARD_BUDGET_MS = 40000;
+  const HARD_BUDGET_MS = 60000; // 60s totalbudget
   const started = Date.now();
 
   const browser = await chromium.launch({ args: LAUNCH_ARGS });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
     locale: 'sv-SE',
+    timezoneId: 'Europe/Mariehamn',
     javaScriptEnabled: true,
     extraHTTPHeaders: { 'Accept-Language': 'sv-SE,sv;q=0.9,fi;q=0.8,en;q=0.7' }
   });
   const page = await context.newPage();
 
-  page.setDefaultTimeout(18000);
-  page.setDefaultNavigationTimeout(25000);
+  page.setDefaultTimeout(20000);
+  page.setDefaultNavigationTimeout(30000);
   await throttleResources(page);
 
   await context.addInitScript(() => {
@@ -278,6 +276,14 @@ async function runJobForKohde(kohdeId, debug=false) {
     } catch {}
   });
 
+  // WATCHDOG – om något låser sig, avbryt och skriv fel
+  const watchdog = setTimeout(async () => {
+    cache[key].inProgress = false;
+    cache[key].lastError = 'Watchdog timeout – sidan gav inte data i tid';
+    cache[key].lastDebug = debug ? { captured: captured.slice(0,5) } : null;
+    try { await browser.close(); } catch {}
+  }, HARD_BUDGET_MS + 5000);
+
   try {
     const baseSv = 'https://www.veikkaus.fi/sv/vedonlyonti/vakio';
     const baseFi = 'https://www.veikkaus.fi/fi/vedonlyonti/vakio';
@@ -285,18 +291,18 @@ async function runJobForKohde(kohdeId, debug=false) {
     const urlFi = `${baseFi}?kohde=${encodeURIComponent(kohdeId)}`;
     const candidates = [urlSv, urlFi];
 
-    for (let round = 0; round < 2; round++) {
+    for (let round = 0; round < 3; round++) {
       for (const url of candidates) {
         if (Date.now() - started > HARD_BUDGET_MS) break;
 
         await page.goto(url, { waitUntil: 'domcontentloaded' });
-        await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(()=>{});
-        await slowScroll(page, 6, 250);
-        await sleep(800);
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(()=>{});
+        await slowScroll(page, 7, 280);
+        await sleep(900);
 
         let got = await tryExtractAll(page, jsonBodies);
         if (!got) {
-          await sleep(1000);
+          await sleep(1200);
           got = await tryExtractAll(page, jsonBodies);
         }
         if (got && got.matches?.length === 13) {
@@ -312,28 +318,31 @@ async function runJobForKohde(kohdeId, debug=false) {
             lastError: null,
             lastDebug: debug ? { captured: captured.slice(0,5) } : null
           };
+          clearTimeout(watchdog);
           await browser.close();
           return { ok: true, kohde: kohdeId };
         }
       }
-      await sleep(800);
+      await sleep(900);
     }
 
     cache[key].inProgress = false;
     cache[key].lastError = 'No 13-match draw found';
     cache[key].lastDebug = debug ? { captured: captured.slice(0,5) } : null;
+    clearTimeout(watchdog);
     await browser.close();
     return { ok: false, error: 'No 13-match draw found' };
   } catch (err) {
     cache[key].inProgress = false;
     cache[key].lastError = String(err?.message || err);
     cache[key].lastDebug = debug ? { captured: captured.slice(0,5) } : null;
+    clearTimeout(watchdog);
     try { await browser.close(); } catch {}
     return { ok: false, error: String(err?.message || err) };
   }
 }
 
-/** Auto-läge: hitta kohde-id och skrapa tills vi får 13 matcher */
+/** AUTO: hitta kohde-id och skrapa tills vi får 13 matcher, med watchdog */
 async function runJobAuto(debug=false) {
   const key = 'auto';
   if (!cache[key]) cache[key] = {};
@@ -343,24 +352,31 @@ async function runJobAuto(debug=false) {
   cache[key].lastError = null;
   cache[key].lastDebug = null;
 
+  const HARD_BUDGET_MS = 90000; // 90s för auto
+  const watchdog = setTimeout(() => {
+    cache[key].inProgress = false;
+    cache[key].lastError = 'Watchdog timeout (auto) – hittade ingen kohde i tid';
+  }, HARD_BUDGET_MS + 5000);
+
   const browser = await chromium.launch({ args: LAUNCH_ARGS });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
     locale: 'sv-SE',
+    timezoneId: 'Europe/Mariehamn',
     javaScriptEnabled: true,
     extraHTTPHeaders: { 'Accept-Language': 'sv-SE,sv;q=0.9,fi;q=0.8,en;q=0.7' }
   });
 
   try {
-    const ids = await discoverKohdeIds(context); // nyast först
+    const ids = await discoverKohdeIds(context);
     if (!ids.length) {
       cache[key].inProgress = false;
       cache[key].lastError = 'Hittade inga kohde-id på vakio-sidorna';
+      clearTimeout(watchdog);
       await browser.close();
       return { ok: false, error: 'No kohde ids found' };
     }
 
-    // prova i tur och ordning tills vi hittar en med 13 matcher
     for (const id of ids) {
       const r = await runJobForKohde(id, debug);
       if (r?.ok) {
@@ -376,6 +392,7 @@ async function runJobAuto(debug=false) {
           lastError: null,
           lastDebug: debug ? cache[id].lastDebug : null
         };
+        clearTimeout(watchdog);
         await browser.close();
         return { ok: true, kohde: id };
       }
@@ -383,11 +400,13 @@ async function runJobAuto(debug=false) {
 
     cache[key].inProgress = false;
     cache[key].lastError = 'Hittade ingen kohde med 13 matcher';
+    clearTimeout(watchdog);
     await browser.close();
     return { ok: false, error: 'No 13-match kohde found' };
   } catch (e) {
     cache[key].inProgress = false;
     cache[key].lastError = String(e?.message || e);
+    clearTimeout(watchdog);
     try { await browser.close(); } catch {}
     return { ok: false, error: String(e?.message || e) };
   }
@@ -400,13 +419,14 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'vakio-scraper', ts: Date.now() });
 });
 
-// Endast hitta kohde-id (felsökning / manuell koll)
+// Lista kohde-id (felsökning)
 app.get('/api/veikkaus/find', async (req, res) => {
   try {
     const browser = await chromium.launch({ args: LAUNCH_ARGS });
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
       locale: 'sv-SE',
+      timezoneId: 'Europe/Mariehamn',
       javaScriptEnabled: true,
     });
     const ids = await discoverKohdeIds(context);
@@ -471,14 +491,10 @@ app.get('/api/veikkaus/last', (req, res) => {
   });
 });
 
-/** Enkel “timer”: försök auto en gång i timmen. 
- * (På Render Free kan dynon sova, men när den är uppe hjälper detta.)
- */
+/** Enkel cron: försök auto varje timme */
 setInterval(() => {
-  const hour = new Date().getUTCHours(); // enkel variant (UTC)
-  // Kör inte för ofta – men försök ibland
   runJobAuto(false).catch(()=>{});
-}, 60 * 60 * 1000); // varje timme
+}, 60 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`vakio-scraper listening on :${PORT}`);
